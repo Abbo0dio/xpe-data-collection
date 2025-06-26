@@ -3,8 +3,9 @@ import pytesseract
 import pandas as pd
 import tkinter as tk
 import difflib
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 from langdetect import detect
+import numpy as np
 import os
 
 DEFAULT_RESOLUTION = (2560, 1440)
@@ -49,6 +50,172 @@ TEAM2_ROUNDS_BOX = (1400, 120, 1525, 205)
 DEBUG_FOLDER = "debug_cells"
 os.makedirs(DEBUG_FOLDER, exist_ok=True)
 
+# Enhanced OCR Class (same as main file)
+class FontAwareOCR:
+    def __init__(self, font_path=None):
+        self.font_path = font_path
+        self.digit_templates_1080p = None
+        self.digit_templates_1440p = None
+        
+    def generate_digit_templates(self, resolution_height):
+        """Generate template images for digits 0-9 using the actual font"""
+        font_size = 18 if resolution_height == 1080 else 24
+        
+        try:
+            if self.font_path and os.path.exists(self.font_path):
+                font = ImageFont.truetype(self.font_path, font_size)
+            else:
+                font = ImageFont.load_default()
+        except:
+            font = ImageFont.load_default()
+            
+        templates = {}
+        
+        for digit in '0123456789':
+            img = Image.new('RGB', (50, 40), color='black')
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 5), digit, fill='white', font=font)
+            template = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            templates[digit] = template
+            
+        return templates
+
+    def preprocess_1080p(self, image):
+        """Optimized preprocessing for 1080p images"""
+        height, width = image.shape[:2]
+        upscaled = cv2.resize(image, (width * 2, height * 2), interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.medianBlur(gray, 3)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(denoised)
+        thresh = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        kernel = np.ones((2,2), np.uint8)
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        return cleaned
+    
+    def preprocess_1440p(self, image):
+        """Standard preprocessing for 1440p"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        return thresh
+
+    def template_match_digits(self, image, templates):
+        """Use template matching for better digit recognition"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        best_match = None
+        best_score = 0
+        
+        for digit, template in templates.items():
+            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            
+            for scale in [0.8, 1.0, 1.2]:
+                scaled_template = cv2.resize(template_gray, None, fx=scale, fy=scale)
+                
+                if scaled_template.shape[0] > gray.shape[0] or scaled_template.shape[1] > gray.shape[1]:
+                    continue
+                    
+                result = cv2.matchTemplate(gray, scaled_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+                
+                if max_val > best_score:
+                    best_score = max_val
+                    best_match = digit
+        
+        return best_match if best_score > 0.6 else None
+
+    def apply_1080p_fixes(self, text):
+        """Enhanced character fixes for 1080p OCR artifacts"""
+        fixes = {
+            'T': '1', 'e': '4', 'a': '4', '?': '7', 'F': '7',
+            'S': '5', 'g': '9', 'G': '6', 'b': '6', 'B': '8',
+            'O': '0', 'o': '0', 'D': '0', 'Q': '0',
+            'I': '1', 'l': '1', '|': '1', 'i': '1',
+            'Z': '2', 'z': '2', 'R': '2',
+            'E': '3', 'A': '4', 's': '5',
+            'C': '6', 'c': '6', 'L': '7', 'P': '9'
+        }
+        
+        result = ""
+        for char in text:
+            result += fixes.get(char, char)
+        
+        return result
+    
+    def extract_player_name(self, image, is_1080p):
+        """Extract player names with language detection"""
+        if is_1080p:
+            processed = self.preprocess_1080p(image)
+        else:
+            processed = self.preprocess_1440p(image)
+        
+        configs = [
+            '--oem 3 --psm 8',
+            '--oem 3 --psm 7',
+            '--oem 3 --psm 13'
+        ]
+        
+        results = []
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(processed, config=config, lang='eng').strip()
+                if text and len(text) > 1:
+                    results.append(text)
+            except:
+                continue
+        
+        if results:
+            return max(set(results), key=results.count)
+        
+        return extract_text(image, 'eng')
+    
+    def extract_number(self, image, is_1080p):
+        """Extract numbers with template matching fallback"""
+        
+        if is_1080p:
+            if self.digit_templates_1080p is None:
+                self.digit_templates_1080p = self.generate_digit_templates(1080)
+            
+            match_result = self.template_match_digits(image, self.digit_templates_1080p)
+            if match_result is not None:
+                return int(match_result)
+        
+        if is_1080p:
+            processed = self.preprocess_1080p(image)
+        else:
+            processed = self.preprocess_1440p(image)
+        
+        configs = [
+            '--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789',
+            '--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789',
+            '--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789'
+        ]
+        
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(processed, config=config).strip()
+                
+                if is_1080p:
+                    text = self.apply_1080p_fixes(text)
+                
+                digits = ''.join(filter(str.isdigit, text))
+                if digits:
+                    return int(digits)
+            except:
+                continue
+        
+        try:
+            text = extract_text(image)
+            if is_1080p:
+                text = self.apply_1080p_fixes(str(text))
+            digits = ''.join(filter(str.isdigit, str(text)))
+            return int(digits) if digits else 0
+        except:
+            return 0
+
 def auto_scale(value, original, actual):
     return int(value * actual / original)
 
@@ -81,26 +248,59 @@ def color_extract_text(image, color='green'):
     config = '--oem 3 --psm 7'
     return pytesseract.image_to_string(thresh, config=config, lang='eng').strip()
 
-def extract_text(image, lang='eng', adaptive=False):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if adaptive:
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
-    else:
+def extract_text(image, lang='eng', adaptive=False, retries=True):
+    def preprocess_standard(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        return thresh
+
+    def preprocess_adaptive(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11, 2
+        )
+
+    def preprocess_robust(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.medianBlur(gray, 3)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresh
+
     config = '--oem 3 --psm 7'
-    return pytesseract.image_to_string(thresh, config=config, lang=lang).strip()
+
+    try:
+        if adaptive:
+            thresh = preprocess_adaptive(image)
+        else:
+            thresh = preprocess_standard(image)
+
+        text = pytesseract.image_to_string(thresh, config=config, lang=lang).strip()
+
+        if retries and (not text or text.strip() in ['0', '', '\x0c']):
+            robust_thresh = preprocess_robust(image)
+            retry_text = pytesseract.image_to_string(robust_thresh, config=config, lang=lang).strip()
+            if retry_text and retry_text != text:
+                text = retry_text
+
+    except Exception:
+        text = ''
+
+    return text
 
 def extract_map_name(region):
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     text = pytesseract.image_to_string(thresh, config="--psm 7")
     text = text.strip().upper().replace('\n', '').replace('\x0c', '')
+    print("Cleaned OCR result:", repr(text))
     closest = difflib.get_close_matches(text, MAP_NAMES, n=1, cutoff=0.4)
     return closest[0] if closest else "Unknown"
 
 def clean_round_score(text):
-    fixes = {'(': '1', '{': '1', '|': '4', 'l': '1', 'I': '1', 'o': '0', 'O': '0', '“': '1', '"': '1'}
+    fixes = {'(': '1', '{': '1', '|': '4', 'l': '1', 'I': '1', 'o': '0', 'O': '0', '"': '1', '"': '1'}
     cleaned = ''.join(fixes.get(c, c) for c in text)
     digits = ''.join(filter(str.isdigit, cleaned))
     return int(digits) if digits else -1
@@ -111,7 +311,8 @@ def detect_language(text):
     except:
         return 'unknown'
 
-def extract_scoreboard(image_path):
+def extract_scoreboard(image_path, font_path=None):
+    """Enhanced scoreboard extraction with debugging and font-aware OCR"""
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError("Could not load image")
@@ -119,15 +320,39 @@ def extract_scoreboard(image_path):
     img_h, img_w = img.shape[:2]
     is_1080p = img_w == 1920 and img_h == 1080
 
-    origin = SCOREBOARD_ORIGIN_1920 if is_1080p else SCOREBOARD_ORIGIN_2560
-    row_height = ROW_HEIGHT_2560 if not is_1080p else auto_scale(ROW_HEIGHT_2560, DEFAULT_RESOLUTION[1], img_h)
-    row_spacing = ROW_SPACING_2560 if not is_1080p else auto_scale(ROW_SPACING_2560, DEFAULT_RESOLUTION[1], img_h)
+    print(f"Image resolution: {img_w}x{img_h} (1080p: {is_1080p})")
 
-    columns = COLUMNS_1920 if is_1080p else {
-        k: (auto_scale(x1, DEFAULT_RESOLUTION[0], img_w),
-            auto_scale(x2, DEFAULT_RESOLUTION[0], img_w))
-        for k, (x1, x2) in COLUMNS_2560.items()
-    }
+    # Initialize enhanced OCR
+    if font_path is None:
+        possible_fonts = [
+            "valorant_font.ttf",
+            "fonts/valorant_font.ttf", 
+            "assets/valorant_font.ttf",
+            "public/valorant_font.ttf"
+        ]
+        for font in possible_fonts:
+            if os.path.exists(font):
+                font_path = font
+                print(f"Found font: {font_path}")
+                break
+    
+    ocr_engine = FontAwareOCR(font_path)
+
+    # Use appropriate coordinate system
+    if is_1080p:
+        origin = SCOREBOARD_ORIGIN_1920
+        columns = COLUMNS_1920
+        row_height = auto_scale(ROW_HEIGHT_2560, DEFAULT_RESOLUTION[1], img_h)
+        row_spacing = auto_scale(ROW_SPACING_2560, DEFAULT_RESOLUTION[1], img_h)
+    else:
+        origin = SCOREBOARD_ORIGIN_2560
+        columns = {
+            k: (auto_scale(x1, DEFAULT_RESOLUTION[0], img_w),
+                auto_scale(x2, DEFAULT_RESOLUTION[0], img_w))
+            for k, (x1, x2) in COLUMNS_2560.items()
+        }
+        row_height = auto_scale(ROW_HEIGHT_2560, DEFAULT_RESOLUTION[1], img_h)
+        row_spacing = auto_scale(ROW_SPACING_2560, DEFAULT_RESOLUTION[1], img_h)
 
     col_min_x = min(c[0] for c in columns.values())
     col_max_x = max(c[1] for c in columns.values())
@@ -136,47 +361,69 @@ def extract_scoreboard(image_path):
     bbox_x2 = bbox_x1 + scoreboard_width
     bbox_y2 = bbox_y1 + row_spacing * NUM_ROWS
 
-    map_box = [auto_scale(x, DEFAULT_RESOLUTION[0 if i % 2 == 0 else 1], img_w if i % 2 == 0 else img_h) for i, x in enumerate(MAP_NAME_BOX)]
-    t1_box = [auto_scale(x, DEFAULT_RESOLUTION[0 if i % 2 == 0 else 1], img_w if i % 2 == 0 else img_h) for i, x in enumerate(TEAM1_ROUNDS_BOX)]
-    t2_box = [auto_scale(x, DEFAULT_RESOLUTION[0 if i % 2 == 0 else 1], img_w if i % 2 == 0 else img_h) for i, x in enumerate(TEAM2_ROUNDS_BOX)]
+    def scale_box(box):
+        x1, y1, x2, y2 = box
+        return (
+            auto_scale(x1, DEFAULT_RESOLUTION[0], img_w),
+            auto_scale(y1, DEFAULT_RESOLUTION[1], img_h),
+            auto_scale(x2, DEFAULT_RESOLUTION[0], img_w),
+            auto_scale(y2, DEFAULT_RESOLUTION[1], img_h)
+        )
+
+    map_box = scale_box(MAP_NAME_BOX)
+    team1_box = scale_box(TEAM1_ROUNDS_BOX)
+    team2_box = scale_box(TEAM2_ROUNDS_BOX)
 
     map_name = extract_map_name(crop_box(img, *map_box))
-    t1_score = clean_round_score(color_extract_text(crop_box(img, *t1_box), 'green'))
-    t2_score = clean_round_score(color_extract_text(crop_box(img, *t2_box), 'red'))
+    t1_score = clean_round_score(color_extract_text(crop_box(img, *team1_box), 'green'))
+    t2_score = clean_round_score(color_extract_text(crop_box(img, *team2_box), 'red'))
     winner = "Team 1" if t1_score > t2_score else "Team 2" if t2_score > t1_score else "Draw"
 
+    # Extract scoreboard with enhanced OCR and debugging
     player_data = []
     for i in range(NUM_ROWS):
         row_top = bbox_y1 + int(i * row_spacing)
         row_info = {}
+        
         for col_name, (col_x1, col_x2) in columns.items():
             crop_x1 = bbox_x1 + (col_x1 - col_min_x)
             crop_x2 = bbox_x1 + (col_x2 - col_min_x)
             cell = img[row_top:row_top + row_height, crop_x1:crop_x2]
 
+            # Save debug cell image
             debug_path = os.path.join(DEBUG_FOLDER, f"row{i}_{col_name}.png")
             cv2.imwrite(debug_path, cell)
 
             if col_name == 'Player':
-                primary_text = extract_text(cell, lang='eng')
-                lang_detected = detect_language(primary_text)
-                if lang_detected == 'ar':
-                    text = extract_text(cell, lang='ara', adaptive=True)
-                elif lang_detected == 'ja':
-                    text = extract_text(cell, lang='jpn', adaptive=True)
-                else:
-                    text = primary_text
+                # Use enhanced player name extraction
+                text = ocr_engine.extract_player_name(cell, is_1080p)
+                
+                # Fallback to language detection if needed
+                if not text or len(text) < 2:
+                    primary_text = extract_text(cell, lang='eng')
+                    lang_detected = detect_language(primary_text)
+                    if lang_detected == 'ar':
+                        text = extract_text(cell, lang='ara', adaptive=True)
+                    elif lang_detected == 'ja':
+                        text = extract_text(cell, lang='jpn', adaptive=True)
+                    else:
+                        text = primary_text
+                
+                print(f"Row {i} Player: {text}")
             else:
-                text = extract_text(cell)
+                # Use enhanced number extraction
+                old_text = extract_text(cell)
+                enhanced_text = ocr_engine.extract_number(cell, is_1080p)
+                
+                print(f"Row {i} {col_name}: '{old_text}' -> {enhanced_text}")
+                
+                # Apply fixes for debugging comparison
                 if is_1080p:
                     fixes = {'T': '1', 'e': '4', 'a': '4', '?': '7', 'F': '7'}
-                    print(text)
-                    text = ''.join(fixes.get(c, c) for c in text)
-                    print(text)
-                try:
-                    text = int(''.join(filter(str.isdigit, text)))
-                except:
-                    text = "Unknown"
+                    fixed_old = ''.join(fixes.get(c, c) for c in str(old_text))
+                    print(f"  Old method with fixes: '{fixed_old}'")
+                
+                text = enhanced_text
 
             row_info[col_name] = text
         player_data.append(row_info)
@@ -192,9 +439,10 @@ if __name__ == "__main__":
         sys.exit(1)
 
     image_path = sys.argv[1]
+    font_path = sys.argv[2] if len(sys.argv) >= 3 else None
 
     try:
-        map_name, t1, t2, winner, df = extract_scoreboard(image_path)
+        map_name, t1, t2, winner, df = extract_scoreboard(image_path, font_path)
         print(json.dumps({
             "map": map_name,
             "team1_rounds": t1,
